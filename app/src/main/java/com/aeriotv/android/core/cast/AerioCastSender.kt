@@ -106,6 +106,10 @@ class AerioCastSender @Inject constructor(
     private companion object {
         const val TAG = "AerioCast"
 
+        /** The launch intent the next Cast launch uses ([CastLaunchIntent]). */
+        const val LAUNCH_PREFS = "aerio_cast_launch"
+        const val KEY_LAUNCH_INTENT = "launch_intent"
+
         /** How long the sender waits for the receiver-type handshake answer
          *  (CMD_RECEIVER_INFO) before it gives up and assumes a web receiver.
          *
@@ -436,10 +440,14 @@ class AerioCastSender @Inject constructor(
             Log.i(TAG, "[Cast] target=android-tv-app, native playback (receiver answered)")
         } else if (answered) {
             Log.i(TAG, "[Cast] target=web-receiver (receiver answered)")
-            // Only an explicit web answer demotes a device: a timeout can be a
-            // slow Cast Connect cold start on a TV that still has the app.
+            // Only an explicit web answer to a launch that ASKED for the TV app
+            // demotes a device: that is Cast Connect falling back because the
+            // app is gone. A plain cast (Google Cast entry) is supposed to come
+            // up on the web receiver even on a TV that has the app (owner rule
+            // 2026-11-14), so its answer says nothing about the app. A timeout
+            // can be a slow Cast Connect cold start, so it never demotes either.
             val id = currentDeviceId
-            if (nativeDevices.forget(id)) {
+            if (_launchIntent.value == CastLaunchIntent.TvApp && nativeDevices.forget(id)) {
                 Log.i(TAG, "[Cast] device $id no longer AerioTV on TV")
             }
         } else {
@@ -1000,15 +1008,25 @@ class AerioCastSender @Inject constructor(
             }
             endCleanup()
             // Picker switch: the old session is gone, now start on the new device.
-            switchTarget?.let { (router, route) ->
+            // The next launch is a plain cast unless a switch picked from
+            // "AerioTV on TV" is waiting (owner rule 2026-11-14).
+            val pending = switchTarget
+            setLaunchIntent(CastLaunchIntent.afterSessionEnd(pending?.third))
+            pending?.let { (router, route, _) ->
                 switchTarget = null
                 Log.i(TAG, "[Cast] switch: previous session ended, selecting ${route.name}")
                 runCatching { router.selectRoute(route) }
             }
         }
         override fun onSessionSuspended(session: CastSession, reason: Int) = refreshFromContext()
-        override fun onSessionStartFailed(session: CastSession, error: Int) = endCleanup()
-        override fun onSessionResumeFailed(session: CastSession, error: Int) = endCleanup()
+        override fun onSessionStartFailed(session: CastSession, error: Int) {
+            endCleanup()
+            setLaunchIntent(CastLaunchIntent.WebReceiver)
+        }
+        override fun onSessionResumeFailed(session: CastSession, error: Int) {
+            endCleanup()
+            setLaunchIntent(CastLaunchIntent.WebReceiver)
+        }
         override fun onSessionEnding(session: CastSession) {
             // The SDK announces a GRACEFUL end here before onSessionEnded. An
             // abrupt loss (receiver died, network dropped) skips this callback
@@ -1030,6 +1048,15 @@ class AerioCastSender @Inject constructor(
             val cc = CastContext.getSharedInstance(context.applicationContext)
             cc.addCastStateListener(castStateListener)
             cc.sessionManager.addSessionManagerListener(sessionListener, CastSession::class.java)
+            // A resumed session keeps the entry it was picked from; anything
+            // else starts as a plain cast (owner rule 2026-11-14).
+            val saved = CastLaunchIntent.of(
+                context.applicationContext.getSharedPreferences(LAUNCH_PREFS, Context.MODE_PRIVATE).getString(KEY_LAUNCH_INTENT, null),
+            ) ?: CastLaunchIntent.WebReceiver
+            cc.setLaunchCredentialsData(
+                com.google.android.gms.cast.CredentialsData(saved.wire, com.google.android.gms.cast.CredentialsData.CREDENTIALS_TYPE_ANDROID),
+            )
+            _launchIntent.value = saved
             onCastState(cc.castState)
             Log.i(TAG, "warm ok; castState=${cc.castState} appId=${BuildConfig.CAST_RECEIVER_APP_ID}")
         }
@@ -1106,7 +1133,7 @@ class AerioCastSender @Inject constructor(
      *  chooser to discover cast devices. Null when Cast is unavailable. */
     /** Picker route switch in flight: the route to select once the current
      *  session reports its end. */
-    private var switchTarget: Pair<MediaRouter, MediaRouter.RouteInfo>? = null
+    private var switchTarget: Triple<MediaRouter, MediaRouter.RouteInfo, CastLaunchIntent>? = null
     /** Channel id (or cast mediaId) that follows the user to the next receiver
      *  (Change Cast Device, or a picker switch while playing). Held here, not in
      *  the cast card: a switch drops the session, which removes the card from
@@ -1140,13 +1167,22 @@ class AerioCastSender @Inject constructor(
      * can surface as an involuntary "disconnected" end, so the switch is made
      * explicit here instead of relying on it.
      */
-    fun selectPickerRoute(router: MediaRouter?, route: MediaRouter.RouteInfo) {
+    fun selectPickerRoute(
+        router: MediaRouter?,
+        route: MediaRouter.RouteInfo,
+        /** [CastLaunchIntent.TvApp] only from the "AerioTV on TV" entry; a "Google Cast" pick is a plain cast. */
+        intent: CastLaunchIntent = CastLaunchIntent.WebReceiver,
+    ) {
+        // A TV with the app has a row in each section, so tapping the other
+        // row of the connected TV is a switch of receiver on the same device.
+        val sameTvOtherEntry = route.isSelected && _launchIntent.value != intent
+        setLaunchIntent(intent)
         val current = _state.value as? State.Connected
-        if (router != null && current != null && !route.isSelected) {
+        if (router != null && current != null && (!route.isSelected || sameTvOtherEntry)) {
             Log.i(TAG, "[Cast] picker selected ${route.name} while ${current.deviceName} is connected: ending it first")
             val handoff = _content.value?.mediaId
             val keep = handoffChannelId
-            switchTarget = router to route
+            switchTarget = Triple(router, route, intent)
             stopCasting()
             // Armed after the stop (which clears it); nothing playing and no
             // Change Device handoff means nothing follows.
@@ -1154,6 +1190,32 @@ class AerioCastSender @Inject constructor(
             return
         }
         runCatching { router?.selectRoute(route) }
+    }
+
+    /**
+     * Name the receiver the NEXT Cast launch is for (owner rule 2026-11-14: a
+     * basic cast must not need the app). The SDK launches the AerioTV Android
+     * TV app on any TV that has it; the TV app declines a launch whose
+     * credentials say [CastLaunchIntent.WebReceiver], and the Cast framework
+     * then loads the web receiver. Kept across a reconnect or a resumed session
+     * (the same pick), persisted for a resume after this process restarts, and
+     * back to a plain cast once a session ends. No secret rides here.
+     */
+    private val _launchIntent = MutableStateFlow(CastLaunchIntent.WebReceiver)
+    /** The entry the current (or next) session was picked from; the picker
+     *  marks only that row of a TV listed in both sections as connected. */
+    val launchIntent: StateFlow<CastLaunchIntent> = _launchIntent.asStateFlow()
+
+    private fun setLaunchIntent(intent: CastLaunchIntent) {
+        val ctx = appContext ?: return
+        runCatching {
+            CastContext.getSharedInstance()?.setLaunchCredentialsData(
+                com.google.android.gms.cast.CredentialsData(intent.wire, com.google.android.gms.cast.CredentialsData.CREDENTIALS_TYPE_ANDROID),
+            )
+        }.onFailure { Log.w(TAG, "[Cast] launch intent not set: ${it.javaClass.simpleName}") }
+        ctx.getSharedPreferences(LAUNCH_PREFS, Context.MODE_PRIVATE).edit().putString(KEY_LAUNCH_INTENT, intent.wire).apply()
+        _launchIntent.value = intent
+        Log.i(TAG, "[Cast] next launch: ${if (intent == CastLaunchIntent.TvApp) "AerioTV app on the TV (Cast Connect)" else "web receiver (plain cast)"}")
     }
 
     fun routeSelector(): MediaRouteSelector? =

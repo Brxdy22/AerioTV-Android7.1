@@ -209,17 +209,23 @@ fun CastRouteChooserDialog(
 
     // TVs that already ran a native Cast Connect session (hello reply
     // platform=android-tv-app) are listed FIRST: casting to them plays inside
-    // the AerioTV app on the TV, with no phone-side proxy or transcode. A device
-    // can only be classified once it has been cast to, so it moves up after its
-    // first native session.
+    // the AerioTV app on the TV, with no phone-side proxy or transcode.
+    // A TV that never had one is listed too when its AerioTV app is running:
+    // the app advertises the AerioTV Remote host under the TV's device name,
+    // which is also its Cast name (NSD may add " (n)" on a rename retry).
+    // Without that, only a native session could add a TV, and since a Google
+    // Cast pick is a plain cast (owner rule 2026-11-14) nothing would ever
+    // start the first one. A wrong match only costs a Cast Connect fallback
+    // to the web receiver.
     val nativeIds by sender.nativeDeviceIds.collectAsState()
+    val appTvNames = tvs.map { it.name.replace(Regex("""\s\(\d+\)$"""), "").trim().lowercase() }.toSet()
     val nativeRoutes = routes.filter { route ->
         val id = runCatching { CastDevice.getFromBundle(route.extras)?.deviceId }.getOrNull()
-        id != null && id in nativeIds
+        (id != null && id in nativeIds) || route.name.trim().lowercase() in appTvNames
     }
-    val otherRoutes = routes - nativeRoutes.toSet()
 
     val companionConnected = companionConn is CompanionRemoteController.Conn.Connected
+    val activeIntent by sender.launchIntent.collectAsState()
 
     // Sectioned picker, iOS CastPickerSheet twin (same order, headers, footer
     // and copy; iOS alone adds an AirPlay section):
@@ -227,7 +233,7 @@ fun CastRouteChooserDialog(
     //   pairing code entry / "Connecting to ..."
     //   "AerioTV Remote"  companion TVs (hidden when none)
     //   "AerioTV on TV"   native Cast Connect devices + footer (hidden when none)
-    //   "Google Cast"     other cast devices, "Searching for devices…" when none
+    //   "Google Cast"     EVERY cast device, "Searching for devices…" when none
     // Devices keep discovery order within a section, as on iOS.
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -262,22 +268,28 @@ fun CastRouteChooserDialog(
                     Text(label, color = colors.error)
                 }
             }
+            // The entry decides the receiver (owner rule 2026-11-14): "AerioTV
+            // on TV" launches the TV app; "Google Cast" is always a plain cast
+            // to the web receiver, even on a TV that has the app.
             @Composable
-            fun routeRow(route: MediaRouter.RouteInfo) {
+            fun routeRow(route: MediaRouter.RouteInfo, intent: com.aeriotv.android.core.cast.CastLaunchIntent) {
+                // A TV listed in both sections: only the row it was picked
+                // from shows as connected.
+                val active = route.isSelected && activeIntent == intent
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
                         .clickable {
                             // Mutual exclusion: one remote target at a time.
                             companionRemote?.disconnect()
-                            sender.selectPickerRoute(router, route)
+                            sender.selectPickerRoute(router, route, intent)
                             onDismiss()
                         }
                         .padding(vertical = 12.dp),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
                     Icon(
-                        imageVector = if (route.isSelected) Icons.Filled.CastConnected
+                        imageVector = if (active) Icons.Filled.CastConnected
                         else Icons.Filled.Cast,
                         contentDescription = null,
                         modifier = Modifier.padding(end = 12.dp),
@@ -357,7 +369,7 @@ fun CastRouteChooserDialog(
                 }
                 if (nativeRoutes.isNotEmpty()) {
                     sectionHeader("AerioTV on TV")
-                    nativeRoutes.forEach { routeRow(it) }
+                    nativeRoutes.forEach { routeRow(it, com.aeriotv.android.core.cast.CastLaunchIntent.TvApp) }
                     Text(
                         "Plays in the AerioTV app on the TV: no phone processing, full quality.",
                         style = typo.bodySmall.subtext(),
@@ -368,7 +380,10 @@ fun CastRouteChooserDialog(
                 if (routes.isEmpty()) {
                     Text("Searching for devices…", color = colors.onSurfaceVariant)
                 }
-                otherRoutes.forEach { routeRow(it) }
+                // Every Cast device, including one listed above: a plain cast
+                // must never need the TV app (owner rule 2026-11-14), so a TV
+                // with the app has two rows, each with its own launch intent.
+                routes.forEach { routeRow(it, com.aeriotv.android.core.cast.CastLaunchIntent.WebReceiver) }
             }
         },
         confirmButton = {
